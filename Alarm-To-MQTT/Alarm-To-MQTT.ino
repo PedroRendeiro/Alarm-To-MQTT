@@ -11,15 +11,6 @@
 const char* ssid =                        CONFIG_WIFI_SSID;
 const char* password =                    CONFIG_WIFI_PASSWORD;
 
-// OTA
-#define OTA_PASSWORD                      CONFIG_OTA_PASSWORD
-
-// MQTT
-#define MQTT_SERVER                       CONFIG_MQTT_SERVER
-#define MQTT_SERVERPORT                   CONFIG_MQTT_SERVERPORT
-#define MQTT_USERNAME                     CONFIG_MQTT_USER
-#define MQTT_KEY                          CONFIG_MQTT_PASSWORD
-
 // LED
 #define LED_BUILTIN                       2
 
@@ -29,18 +20,22 @@ const char* password =                    CONFIG_WIFI_PASSWORD;
 #define GREEN_LED_PIN                     25
 #define SS_PIN                            21
 #define RST_PIN                           22
+#define IRQ_PIN                           15
 
 ////////////////////////////////
 // Variables
 ////////////////////////////////
 const int numALARMs =                     2;
-char hostname[32], MQTT_TOPIC[96], buffer[512];
+char hostname[32], buffer[64];
+char telemetryTopic[96], commandTopic[64], commandTopicRestart[64], commandTopicStart[64], commandTopicStop[64], commandTopicAP_Start[64], commandTopicAP_Stop[64], debugTopic[64];
 // Thing
 bool Active = true;
 const String ThingId = CONFIG_THING_ID;
 // RFID
 byte readCard[10];
 uint8_t cardSize;
+volatile bool bNewInt = false;
+byte regVal = 0x7F;
 // Alarm
 bool OPEN, CLOSED, ARMED = false;
 // CLOSED -> All closed
@@ -62,8 +57,31 @@ constexpr unsigned int str2int(const char* str, int h = 0) {
     return !str[h] ? 5381 : (str2int(str, h+1) * 33) ^ str[h];
 }
 
-#define REPORTING_PERIOD                  30000
-#define WATCHDOG_TIMEOUT_PERIOD           86400000
+/*
+ * The function sending to the MFRC522 the needed commands to activate the reception
+ */
+void activateRec(MFRC522 mfrc522) {
+  mfrc522.PCD_WriteRegister(mfrc522.FIFODataReg, mfrc522.PICC_CMD_REQA);
+  mfrc522.PCD_WriteRegister(mfrc522.CommandReg, mfrc522.PCD_Transceive);
+  mfrc522.PCD_WriteRegister(mfrc522.BitFramingReg, 0x87);
+}
+
+/*
+ * The function to clear the pending interrupt bits after interrupt serving routine
+ */
+void clearInt(MFRC522 mfrc522) {
+  mfrc522.PCD_WriteRegister(mfrc522.ComIrqReg, 0x7F);
+}
+
+////////////////////////////////
+// Interrupts
+////////////////////////////////
+/**
+ * MFRC522 interrupt serving routine
+ */
+void IRAM_ATTR MFRC522_ISR() {
+  bNewInt = true;
+}
 
 ////////////////////////////////
 // Structs
@@ -88,13 +106,13 @@ struct ALARM {
       _OPEN = !digitalRead(SENSOR_PIN);
 
       if (_CHANGING) {
-        if (millis() - CHANGE_MILLIS > 3000) {
+        if (millis() - CHANGE_MILLIS > 500) {
           OPEN = _OPEN;
           CLOSED = !_OPEN;
+
+          MQTTclient.publish(telemetryTopic, OPEN ? "Door Open!" : "Door Closed!");
           
           _CHANGING = false;
-          
-          MQTTclient.publish("alarm", OPEN ? "OPEN" : "CLOSED");
         }
         if (_OPEN == OPEN) {
           _CHANGING = false;
@@ -124,9 +142,7 @@ void setup() {
   setupOTA();
   setupMQTT();
 
-  SPI.begin();                                                      // MFRC522 Hardware uses SPI protocol
-  mfrc522.PCD_Init();                                               // Initialize MFRC522 Hardware
-  mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+  setupMFRC522();
 
   for (int Alarm = 0; Alarm < numALARMs; Alarm++) {
     ALARMs[Alarm].begin();
@@ -163,10 +179,6 @@ void loop() {
     if (!CLOSED) {
       Buzzer(true);
     }
-
-    if (getID()) {
-      ARMED = false;
-    }
     
     digitalWrite(RED_LED_PIN, HIGH);
     digitalWrite(GREEN_LED_PIN, LOW);
@@ -180,6 +192,13 @@ void loop() {
     digitalWrite(RED_LED_PIN, LOW);
     digitalWrite(GREEN_LED_PIN, HIGH);
   }
+
+  if (bNewInt) {
+    getID();
+  }
+
+  activateRec(mfrc522);
+  delay(100);
 }
 
 ////////////////////////////////
@@ -235,13 +254,34 @@ bool connectWiFi() {
 // MQTT
 ////////////////////////////////
 void setupMQTT() {
-  MQTTclient.setServer(MQTT_SERVER, MQTT_SERVERPORT);
+  MQTTclient.setServer(CONFIG_MQTT_SERVER, CONFIG_MQTT_SERVERPORT);
   MQTTclient.setCallback(MQTTOnMessage);
 
   MQTTclient.setBufferSize(2048);
 
-  String commandTopicString = "telemetry/" + ThingId + "/alarm";
-  commandTopicString.toCharArray(MQTT_TOPIC, 96);
+  String TopicString = "telemetry/" + ThingId + "/alarm";
+  TopicString.toCharArray(telemetryTopic, 64);
+
+  TopicString = "command/" + ThingId + "/+";
+  TopicString.toCharArray(commandTopic, 64);
+
+  TopicString = "command/" + ThingId + "/restart";
+  TopicString.toCharArray(commandTopicRestart, 64);
+
+  TopicString = "command/" + ThingId + "/start";
+  TopicString.toCharArray(commandTopicStart, 64);
+
+  TopicString = "command/" + ThingId + "/stop";
+  TopicString.toCharArray(commandTopicStop, 64);
+
+  TopicString = "command/" + ThingId + "/ap_start";
+  TopicString.toCharArray(commandTopicAP_Start, 64);
+
+  TopicString = "command/" + ThingId + "/ap_stop";
+  TopicString.toCharArray(commandTopicAP_Stop, 64);
+
+  TopicString = "debug/" + ThingId;
+  TopicString.toCharArray(debugTopic, 64);
   
   loopMQTT();
 }
@@ -259,19 +299,11 @@ void reconnectMQTT() {
   // Loop until we're reconnected
   while (!MQTTclient.connected()) {    
     // Attempt to connect
-    if (MQTTclient.connect(hostname, MQTT_USERNAME, MQTT_KEY)) {
-
-      char commandTopicChar[64], debugTopicChar[64];
-      String commandTopicString, debugTopicString;
-
-      commandTopicString = "command/" + ThingId + "/+";
-      commandTopicString.toCharArray(commandTopicChar, 64);
-      debugTopicString = "debug/" + ThingId;
-      debugTopicString.toCharArray(debugTopicChar, 64);
+    if (MQTTclient.connect(hostname, CONFIG_MQTT_USERNAME, CONFIG_MQTT_PASSWORD)) {
         
-      MQTTclient.subscribe(commandTopicChar);
+      MQTTclient.subscribe(commandTopic);
 
-      MQTTclient.publish(debugTopicChar, "Alarm Connected!");
+      MQTTclient.publish(debugTopic, "Alarm Connected!");
     } else {
       // Wait 5 seconds before retrying
       unsigned long now = millis();
@@ -287,37 +319,39 @@ void reconnectMQTT() {
 }
 
 void MQTTOnMessage(char* topic, byte* payload, unsigned int length) {
-  char commandTopicChar[64], debugTopicChar[64];
-  String commandTopicString, debugTopicString;
-
-  debugTopicString = "debug/" + ThingId;
-  debugTopicString.toCharArray(debugTopicChar, 64);
-
-  commandTopicString = "command/" + ThingId + "/restart";
-  commandTopicString.toCharArray(commandTopicChar, 64);
-  if (str2int(topic) == str2int(commandTopicChar)) {
-    MQTTclient.publish(debugTopicChar, "Restarting Alarm!");
+  if (str2int(topic) == str2int(commandTopicRestart)) {
+    MQTTclient.publish(debugTopic, "Restarting Alarm!");
+    delay(1000);
     ESP.restart();
   }
 
-  commandTopicString = "command/" + ThingId + "/start";
-  commandTopicString.toCharArray(commandTopicChar, 64);
-  if (str2int(topic) == str2int(commandTopicChar)) {
-    MQTTclient.publish(debugTopicChar, "Starting Alarm!");
+  if (str2int(topic) == str2int(commandTopicStart)) {
+    MQTTclient.publish(debugTopic, "Starting Alarm!");
     digitalWrite(RED_LED_PIN, HIGH);
     digitalWrite(GREEN_LED_PIN, HIGH);
     Active = true;
     return;
   }
 
-  commandTopicString = "command/" + ThingId + "/stop";
-  commandTopicString.toCharArray(commandTopicChar, 64);
-  if (str2int(topic) == str2int(commandTopicChar)) {
-    MQTTclient.publish(debugTopicChar, "Stoping Alarm!");
+  if (str2int(topic) == str2int(commandTopicStop)) {
+    MQTTclient.publish(debugTopic, "Stoping Alarm!");
     digitalWrite(RED_LED_PIN, LOW);
     digitalWrite(GREEN_LED_PIN, LOW);
     Buzzer(false);
     Active = false;
+    return;
+  }
+
+  if (str2int(topic) == str2int(commandTopicAP_Start)) {
+    MQTTclient.publish(debugTopic, "Starting AP!");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(hostname);
+    return;
+  }
+
+  if (str2int(topic) == str2int(commandTopicAP_Stop)) {
+    MQTTclient.publish(debugTopic, "Stoping AP!");
+    WiFi.mode(WIFI_STA);
     return;
   }
 
@@ -336,7 +370,10 @@ void setupOTA() {
   ArduinoOTA.setHostname(hostname);
 
   // Set OTA Password
-  ArduinoOTA.setPassword((const char *)OTA_PASSWORD);
+  ArduinoOTA.setPassword((const char *)CONFIG_OTA_PASSWORD);
+
+  // Set OTA Password
+  ArduinoOTA.setPort(8266);
 
   // Init OTA
   ArduinoOTA.begin();
@@ -352,41 +389,83 @@ void loopOTA() {
 ////////////////////////////////
 // Alarm
 ////////////////////////////////
-boolean getID() {
-  mfrc522.PCD_AntennaOn();
+boolean getID() {  
+  detachInterrupt(digitalPinToInterrupt(IRQ_PIN));
   
-  // Getting ready for Reading PICCs
-  if (!mfrc522.PICC_IsNewCardPresent()) { //If a new PICC placed to RFID reader continue
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    setupMFRC522();
     return false;
   }
-  if (!mfrc522.PICC_ReadCardSerial()) {   //Since a PICC placed get Serial and continue
-    return false;
-  }
-  
+
   cardSize = mfrc522.uid.size;
-  for (uint8_t i = 0; i < cardSize; i++) {
-    readCard[i] = mfrc522.uid.uidByte[i];
+  
+  if (cardSize > 0) {
+    for (uint8_t i = 0; i < cardSize; i++) {
+      readCard[i] = mfrc522.uid.uidByte[i];
+    }
+
+    switch (cardSize) {
+      case 4:
+        snprintf(buffer, 64, "{\"id\": \"0x%02X%02X%02X%02X\", \"size\": %d}", readCard[0], readCard[1], readCard[2], readCard[3], cardSize);
+        break;
+      case 7:
+        snprintf(buffer, 64, "{\"id\": \"0x%02X%02X%02X%02X%02X%02X%02X\", \"size\": %d}", readCard[0], readCard[1], readCard[2], readCard[3], readCard[4], readCard[5], readCard[6], cardSize);
+        break;
+      default:
+        clearInt(mfrc522);
+        bNewInt = false;
+        attachInterrupt(digitalPinToInterrupt(IRQ_PIN), MFRC522_ISR, FALLING);
+        return false;
+    }
+  } else {
+    digitalWrite(RED_LED_PIN, LOW);
+    delay(250);
+    digitalWrite(RED_LED_PIN, HIGH);
+    delay(250);
+    digitalWrite(RED_LED_PIN, LOW);
+    delay(250);
+    digitalWrite(RED_LED_PIN, HIGH);
+    delay(250);
+    digitalWrite(RED_LED_PIN, LOW);
   }
-  mfrc522.PICC_HaltA(); // Stop reading
 
-  switch (cardSize) {
-    case 4:
-      snprintf(buffer, 512, "{\"id\": \"%02X%02X%02X%02X\"}", readCard[0], readCard[1], readCard[2], readCard[3]);
-      break;
-    case 7:
-      snprintf(buffer, 512, "{\"id\": \"%02X%02X%02X%02X%02X%02X%02X\"}", readCard[0], readCard[1], readCard[2], readCard[3], readCard[4], readCard[5], readCard[6]);
-      break;
-    default:
-      break;
+  clearInt(mfrc522);
+  mfrc522.PICC_HaltA();
+
+  MQTTclient.publish(telemetryTopic, buffer);
+
+  if (ARMED) {
+    ARMED = false;
   }
+  
+  bNewInt = false;
 
-  MQTTclient.publish("alarm/scanned", buffer);
-
-  mfrc522.PCD_AntennaOff();
+  attachInterrupt(digitalPinToInterrupt(IRQ_PIN), MFRC522_ISR, FALLING);
   
   return true;
 }
 
 void Buzzer(boolean status) {
   digitalWrite(BUZZER_PIN, status);
+}
+
+void setupMFRC522() {
+  SPI.begin();                                                      // MFRC522 Hardware uses SPI protocol
+  mfrc522.PCD_Init();                                               // Initialize MFRC522 Hardware
+  
+  /* read and printout the MFRC522 version (valid values 0x91 & 0x92)*/
+  byte readReg = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+  snprintf(buffer, 64, "{\"version\": \"0x%02X\"}", readReg);
+  MQTTclient.publish(debugTopic, buffer);
+
+  /* setup the IRQ pin*/
+  pinMode(IRQ_PIN, INPUT_PULLUP);
+
+  regVal = 0xA0; //rx irq
+  mfrc522.PCD_WriteRegister(mfrc522.ComIEnReg, regVal);
+
+  bNewInt = false; //interrupt flag
+
+  /*Activate the interrupt*/
+  attachInterrupt(digitalPinToInterrupt(IRQ_PIN), MFRC522_ISR, FALLING);
 }
